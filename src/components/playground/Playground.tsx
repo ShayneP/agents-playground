@@ -32,6 +32,8 @@ import {
   RoomEvent,
   Track,
 } from "livekit-client";
+import { set } from "lodash";
+import { disconnect } from "process";
 import { QRCodeSVG } from "qrcode.react";
 import { ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 
@@ -58,12 +60,15 @@ export default function Playground({
   const [messages, setMessages] = useState<ChatMessageType[]>([]);
   const [transcripts, setTranscripts] = useState<ChatMessageType[]>([]);
   const { localParticipant } = useLocalParticipant();
+  const [currentAgentTrack, setCurrentAgentTrack] = useState<TrackReferenceOrPlaceholder | null>(null);
 
   const participants = useRemoteParticipants({
     updateOnlyOn: [RoomEvent.ParticipantMetadataChanged],
   });
   const agentParticipant = participants.find((p) => p.isAgent);
+  const sipParticipant = participants.find((p) => p.name === "SIP");
   const isAgentConnected = agentParticipant !== undefined;
+  const isSipConnected = sipParticipant !== undefined;
 
   const roomState = useConnectionState();
   const tracks = useTracks();
@@ -72,8 +77,21 @@ export default function Playground({
     if (roomState === ConnectionState.Connected) {
       localParticipant.setCameraEnabled(config.settings.inputs.camera);
       localParticipant.setMicrophoneEnabled(config.settings.inputs.mic);
+      
+      // Find the last agent track
+      const agentTracks = tracks.filter(
+        (trackRef) =>
+          trackRef.publication.kind === Track.Kind.Audio &&
+          trackRef.participant.isAgent
+      );
+      const lastAgentTrack = agentTracks.length > 0 ? agentTracks[agentTracks.length - 1] : null;
+      console.log("Last agent track", lastAgentTrack);
+      console.log("Tracks", tracks);
+      console.log("Agent tracks length", agentTracks.length);
+      
+      setCurrentAgentTrack(lastAgentTrack);
     }
-  }, [config, localParticipant, roomState]);
+  }, [roomState, tracks, localParticipant]); // Add dependencies to useEffect
 
   let agentAudioTrack: TrackReferenceOrPlaceholder | undefined;
   const aat = tracks.find(
@@ -90,14 +108,31 @@ export default function Playground({
     };
   }
 
-  const agentVideoTrack = tracks.find(
+  let phoneAudioTrack: TrackReferenceOrPlaceholder | undefined;
+  const pat = tracks.find(
     (trackRef) =>
-      trackRef.publication.kind === Track.Kind.Video &&
-      trackRef.participant.isAgent
+      trackRef.publication.kind === Track.Kind.Audio &&
+      trackRef.participant.name === "SIP"
+  );
+  if (pat) {
+    phoneAudioTrack = pat;
+  } else if (sipParticipant) {
+    // Change over the agent visualizer
+    phoneAudioTrack = {
+      participant: sipParticipant,
+      source: Track.Source.Microphone,
+    };
+  }
+
+  // Set state as first agent track, then switch to the second agent track the phone call connects
+
+  const subscribedAgentVolumes = useMultibandTrackVolume(
+    currentAgentTrack?.publication?.track,
+    5
   );
 
-  const subscribedVolumes = useMultibandTrackVolume(
-    agentAudioTrack?.publication?.track,
+  const subscribedPhoneVolumes = useMultibandTrackVolume(
+    phoneAudioTrack?.publication?.track,
     5
   );
 
@@ -141,45 +176,99 @@ export default function Playground({
   );
 
   useDataChannel(onDataReceived);
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [isCalling, setIsCalling] = useState(false);
 
-  const videoTileContent = useMemo(() => {
-    const videoFitClassName = `object-${config.video_fit || "cover"}`;
+  const phoneTileContent = useMemo(() => {
 
     const disconnectedContent = (
-      <div className="flex items-center justify-center text-gray-700 text-center w-full h-full">
-        No video track. Connect to get started.
+      <div className="flex flex-col items-center justify-center gap-2 text-gray-700 text-center w-full">
+        Connect to make a call.
       </div>
     );
 
-    const loadingContent = (
-      <div className="flex flex-col items-center justify-center gap-2 text-gray-700 text-center h-full w-full">
+    const noPhoneContent = (
+      <div className="flex flex-col items-center justify-center gap-2 text-gray-700 text-center w-full">
+        <input
+          type="text"
+          placeholder="Enter phone number"
+          id="phoneNumberInput"
+          className="border p-2 rounded text-center"
+        />
+        <button
+          onClick={() => {
+            setIsCalling(true);
+            const phoneNumber = (document.getElementById('phoneNumberInput') as HTMLInputElement).value;
+            if (phoneNumber) {
+              // Send fetch request
+              fetch('http://localhost:4567/api/create_sip_participant', {
+                method: 'POST',
+                mode: 'no-cors',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ phoneNumber, roomName: name }),
+              }).then(response => {
+                setIsCalling(true);
+              }).catch(error => {
+                // Hide loading spinner and handle error
+                setIsCalling(true);
+              });
+            }
+          }}
+          className="flex flex-row  text-gray-950 text-sm justify-center border border-transparent bg-cyan-500 px-3 py-1 rounded-md transition ease-out duration-250 hover:bg-transparent hover:shadow-cyan hover:border-cyan-500 hover:text-cyan-500 active:scale-[0.98] undefined"
+        >
+          Call
+        </button>
+        <div id="loadingSpinner" style={{ display: 'none' }}>
+          <LoadingSVG />
+        </div>
+      </div>
+    );
+  
+    const waitingContent = (
+      <div className="flex flex-col items-center gap-2 text-gray-700 text-center w-full">
         <LoadingSVG />
-        Waiting for video track
+        Waiting for phone to connect
       </div>
     );
-
-    const videoContent = (
-      <VideoTrack
-        trackRef={agentVideoTrack}
-        className={`absolute top-1/2 -translate-y-1/2 ${videoFitClassName} object-position-center w-full h-full`}
-      />
+  
+    // TODO: keep it in the speaking state until we come up with a better protocol for agent states
+    const visualizerContent = (
+      <div className="flex items-center justify-center w-full">
+        <AgentMultibandAudioVisualizer
+          state="speaking"
+          barWidth={30}
+          minBarHeight={30}
+          maxBarHeight={150}
+          accentColor={"cyan"}
+          accentShade={500}
+          frequencies={subscribedPhoneVolumes}
+          borderRadius={12}
+          gap={16}
+        />
+      </div>
     );
-
-    let content = null;
+  
     if (roomState === ConnectionState.Disconnected) {
-      content = disconnectedContent;
-    } else if (agentVideoTrack) {
-      content = videoContent;
-    } else {
-      content = loadingContent;
+      return disconnectedContent;
+    }
+  
+    if (!phoneAudioTrack) {
+      return noPhoneContent;
     }
 
-    return (
-      <div className="flex flex-col w-full grow text-gray-950 bg-black rounded-sm border border-gray-800 relative">
-        {content}
-      </div>
-    );
-  }, [agentVideoTrack, config, roomState]);
+    if (isCalling && !phoneAudioTrack) {
+      return waitingContent;
+    }
+  
+    return visualizerContent;
+  }, [
+    phoneAudioTrack,
+    config.settings.theme_color,
+    subscribedPhoneVolumes,
+    roomState,
+  ]);
 
   const audioTileContent = useMemo(() => {
     const disconnectedContent = (
@@ -205,13 +294,13 @@ export default function Playground({
           maxBarHeight={150}
           accentColor={config.settings.theme_color}
           accentShade={500}
-          frequencies={subscribedVolumes}
+          frequencies={subscribedAgentVolumes}
           borderRadius={12}
           gap={16}
         />
       </div>
     );
-
+    
     if (roomState === ConnectionState.Disconnected) {
       return disconnectedContent;
     }
@@ -224,7 +313,7 @@ export default function Playground({
   }, [
     agentAudioTrack,
     config.settings.theme_color,
-    subscribedVolumes,
+    subscribedAgentVolumes,
     roomState,
   ]);
 
@@ -232,6 +321,7 @@ export default function Playground({
     if (agentAudioTrack) {
       return (
         <TranscriptionTile
+          sipParticipant={sipParticipant}
           agentAudioTrack={agentAudioTrack}
           accentColor={config.settings.theme_color}
         />
@@ -359,20 +449,6 @@ export default function Playground({
   ]);
 
   let mobileTabs: PlaygroundTab[] = [];
-  if (config.settings.outputs.video) {
-    mobileTabs.push({
-      title: "Video",
-      content: (
-        <PlaygroundTile
-          className="w-full h-full grow"
-          childrenClassName="justify-center"
-        >
-          {videoTileContent}
-        </PlaygroundTile>
-      ),
-    });
-  }
-
   if (config.settings.outputs.audio) {
     mobileTabs.push({
       title: "Audio",
@@ -434,23 +510,21 @@ export default function Playground({
         </div>
         <div
           className={`flex-col grow basis-1/2 gap-4 h-full hidden lg:${
-            !config.settings.outputs.audio && !config.settings.outputs.video
-              ? "hidden"
-              : "flex"
+            !config.settings.outputs.audio ? "hidden" : "flex"
           }`}
         >
-          {config.settings.outputs.video && (
+          {config.settings.outputs.audio && (
             <PlaygroundTile
-              title="Video"
+              title="Phone Audio"
               className="w-full h-full grow"
               childrenClassName="justify-center"
             >
-              {videoTileContent}
+              {phoneTileContent}
             </PlaygroundTile>
           )}
           {config.settings.outputs.audio && (
             <PlaygroundTile
-              title="Audio"
+              title="Agent Audio"
               className="w-full h-full grow"
               childrenClassName="justify-center"
             >

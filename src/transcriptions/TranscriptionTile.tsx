@@ -8,19 +8,28 @@ import {
 import {
   LocalParticipant,
   Participant,
+  RemoteParticipant,
   Track,
   TranscriptionSegment,
 } from "livekit-client";
 import { useEffect, useState } from "react";
 
 export function TranscriptionTile({
+  sipParticipant,
   agentAudioTrack,
   accentColor,
 }: {
+  sipParticipant?: RemoteParticipant;
   agentAudioTrack: TrackReferenceOrPlaceholder;
   accentColor: string;
 }) {
+
+  console.log("TranscriptionTile", sipParticipant, agentAudioTrack, accentColor);
   const agentMessages = useTrackTranscription(agentAudioTrack);
+  const sipMessages = useOptionalTrackTranscription({ rp: sipParticipant });
+  console.log("=====================================")
+  console.log(sipMessages)
+  console.log("=====================================")
   const localParticipant = useLocalParticipant();
   const localMessages = useTrackTranscription({
     publication: localParticipant.microphoneTrack,
@@ -47,6 +56,16 @@ export function TranscriptionTile({
       )
     );
     localMessages.segments.forEach((s) =>
+      transcripts.set(
+        s.id,
+        segmentToChatMessage(
+          s,
+          transcripts.get(s.id),
+          localParticipant.localParticipant
+        )
+      )
+    );
+    sipMessages.forEach((s) =>
       transcripts.set(
         s.id,
         segmentToChatMessage(
@@ -108,4 +127,23 @@ function segmentToChatMessage(
     timestamp: existingMessage?.timestamp ?? Date.now(),
   };
   return msg;
+}
+
+function useOptionalTrackTranscription({ rp }: { rp?: RemoteParticipant }) {
+  const [segments, setSegments] = useState<TranscriptionSegment[]>([]);
+
+  useEffect(() => {
+    const tranRec = (segments: TranscriptionSegment[]) => {
+      setSegments((prev) => {
+        return [...prev, ...segments];
+      });
+    };
+    rp?.on("transcriptionReceived", tranRec);
+
+    return () => {
+      rp?.off("transcriptionReceived", tranRec);
+    };
+  }, [rp]);
+
+  return segments;
 }
